@@ -2,20 +2,18 @@ import json
 import os
 import boto3
 import pandas as pd
-from io import StringIO
+from urllib.parse import unquote_plus
 
 s3 = boto3.client("s3")
 
 BRONZE_PREFIX = os.environ.get("BRONZE_PREFIX", "bronze")
 SILVER_PREFIX = os.environ.get("SILVER_PREFIX", "silver")
 
+# If file is large, skip heavy operations like drop_duplicates
+BIG_FILE_MB = float(os.environ.get("BIG_FILE_MB", "10"))  # threshold in MB
+
 
 def get_bucket_key_from_event(event: dict) -> tuple[str, str]:
-    """
-    Supports:
-    1) S3 notification events (event["Records"][0]["s3"]...)
-    2) EventBridge S3 events (event["detail"]["bucket"]["name"], event["detail"]["object"]["key"])
-    """
     # S3 notification format
     if "Records" in event and event["Records"]:
         rec = event["Records"][0]
@@ -29,54 +27,65 @@ def get_bucket_key_from_event(event: dict) -> tuple[str, str]:
         key = event["detail"]["object"]["key"]
         return bucket, key
 
-    raise KeyError("Unsupported event format: missing 'Records' and 'detail'")
+    raise KeyError(f"Unsupported event format. Keys: {list(event.keys())}")
 
 
 def lambda_handler(event, context):
-    try:
-        bucket, key = get_bucket_key_from_event(event)
-        print(f"Received event for bucket={bucket}, key={key}")
+    bucket, raw_key = get_bucket_key_from_event(event)
 
-        # Only process bronze objects
-        if not key.startswith(f"{BRONZE_PREFIX}/"):
-            print("Not a bronze key. Skipping.")
-            return {"statusCode": 200, "body": "Skipped non-bronze object"}
+    # IMPORTANT: decode URL-encoded keys (fixes NoSuchKey)
+    key = unquote_plus(raw_key)
 
-        # Download CSV from S3
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        df = pd.read_csv(obj["Body"])
+    print(f"Received event: bucket={bucket}, key={key}")
 
-        # Light cleaning for demo
-        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    # Only process bronze
+    if not key.startswith(f"{BRONZE_PREFIX}/"):
+        print("Skipping: not a bronze key.")
+        return {"statusCode": 200, "body": "Skipped non-bronze object"}
+
+    # Head first: size + sanity check
+    head = s3.head_object(Bucket=bucket, Key=key)
+    size_bytes = int(head.get("ContentLength", 0))
+    size_mb = size_bytes / (1024 * 1024)
+    print(f"Object size: {size_bytes} bytes ({size_mb:.2f} MB)")
+
+    # Download and read
+    print("Reading CSV...")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+
+    # Pandas can read file-like directly; keep it simple
+    df = pd.read_csv(obj["Body"])
+
+    # Light cleaning
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # Avoid expensive dedupe for big files (common reason it “never finishes”)
+    if size_mb <= BIG_FILE_MB:
         df = df.drop_duplicates()
+        print("drop_duplicates applied")
+    else:
+        print("Big file detected -> skipping drop_duplicates (to avoid timeout)")
 
-        # Write to silver keeping the same subfolders/filename
-        silver_key = key.replace(f"{BRONZE_PREFIX}/", f"{SILVER_PREFIX}/", 1)
+    # Build output key
+    silver_key = key.replace(f"{BRONZE_PREFIX}/", f"{SILVER_PREFIX}/", 1)
 
-        buf = StringIO()
-        df.to_csv(buf, index=False)
+    # Write to /tmp then upload (more reliable than huge in-memory strings)
+    out_path = "/tmp/out.csv"
+    df.to_csv(out_path, index=False)
 
-        s3.put_object(
-            Bucket=bucket,
-            Key=silver_key,
-            Body=buf.getvalue(),
-            ContentType="text/csv",
-        )
+    s3.upload_file(out_path, bucket, silver_key)
 
-        print(f"Wrote cleaned file to s3://{bucket}/{silver_key}")
+    print(f"Wrote cleaned file to s3://{bucket}/{silver_key}")
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps(
-                {
-                    "message": "Bronze to Silver success",
-                    "input_key": key,
-                    "output_key": silver_key,
-                    "rows": int(len(df)),
-                }
-            ),
-        }
-
-    except Exception as e:
-        print(f"Error in bronze_to_silver: {e}")
-        raise
+    return {
+        "statusCode": 200,
+        "body": json.dumps(
+            {
+                "message": "Bronze → Silver success",
+                "input_key": key,
+                "output_key": silver_key,
+                "rows": int(len(df)),
+                "size_mb": round(size_mb, 2),
+            }
+        ),
+    }
