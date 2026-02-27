@@ -99,3 +99,4 @@ st.dataframe(df.head(500), use_container_width=True)
 with st.expander("Column summary"):
     col = st.selectbox("Column", df.columns.tolist())
     st.write(df[col].describe(include="all"))
+    
