@@ -1,0 +1,87 @@
+name: Deploy Streamlit UI to Elastic Beanstalk (Docker)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "streamlit_app/**"
+      - ".github/workflows/deploy_streamlit_eb.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: eu-north-1
+      AWS_DEFAULT_REGION: eu-north-1
+
+      # ✅ CHANGE THESE if your EB names are different
+      EB_APP_NAME: sports-demo-ui
+      EB_ENV_NAME: sports-demo-ui-env
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+
+      - name: Debug AWS + EB vars
+        run: |
+          aws sts get-caller-identity
+          echo "AWS_REGION=$AWS_REGION"
+          echo "EB_APP_NAME=$EB_APP_NAME"
+          echo "EB_ENV_NAME=$EB_ENV_NAME"
+
+      - name: Install EB CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install awsebcli
+
+      - name: Ensure EB application exists
+        run: |
+          if ! aws elasticbeanstalk describe-applications --application-names "$EB_APP_NAME" >/dev/null 2>&1; then
+            aws elasticbeanstalk create-application --application-name "$EB_APP_NAME"
+          fi
+
+      - name: EB init + ensure environment exists
+        working-directory: streamlit_app
+        run: |
+          eb init "$EB_APP_NAME" --platform docker --region "$AWS_REGION"
+
+          EXISTING_ENV=$(aws elasticbeanstalk describe-environments \
+            --application-name "$EB_APP_NAME" \
+            --environment-names "$EB_ENV_NAME" \
+            --query 'Environments[0].EnvironmentName' \
+            --output text 2>/dev/null || true)
+
+          if [ "$EXISTING_ENV" != "$EB_ENV_NAME" ]; then
+            eb create "$EB_ENV_NAME" --single --region "$AWS_REGION"
+          fi
+
+          eb use "$EB_ENV_NAME"
+
+      - name: Deploy to Elastic Beanstalk
+        working-directory: streamlit_app
+        run: |
+          eb deploy --staged --verbose
+
+      - name: Set EB environment variables (optional)
+        working-directory: streamlit_app
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          GOLD_LATEST_PREFIX: ${{ secrets.GOLD_LATEST_PREFIX }}
+        run: |
+          if [ -n "$S3_BUCKET" ] && [ -n "$GOLD_LATEST_PREFIX" ]; then
+            eb setenv \
+              S3_BUCKET="$S3_BUCKET" \
+              GOLD_LATEST_PREFIX="$GOLD_LATEST_PREFIX" \
+              AWS_REGION="$AWS_REGION"
+          else
+            echo "Skipping eb setenv (S3_BUCKET or GOLD_LATEST_PREFIX missing)."
+          fi

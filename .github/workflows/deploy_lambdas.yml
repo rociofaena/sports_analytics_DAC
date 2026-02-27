@@ -1,0 +1,131 @@
+name: Deploy Lambda Containers (Bronze to Silver + Silver to Gold)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "lambda_functions/**"
+      - ".github/workflows/deploy_lambdas.yml"
+
+jobs:
+  deploy-lambdas:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda_name: sports-demo-dev-bronze-to-silver
+            ecr_repo: sports-demo-dev-lambda-bronze-silver
+            context_dir: lambda_functions/bronze_to_silver
+            timeout: 60
+            memory: 1024
+          - lambda_name: sports-demo-dev-silver-to-gold
+            ecr_repo: sports-demo-dev-lambda-silver-gold
+            context_dir: lambda_functions/silver_to_gold
+            timeout: 180
+            memory: 2048
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-north-1.amazonaws.com
+          ECR_REPOSITORY: ${{ matrix.ecr_repo }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -e
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          IMAGE_URI_LATEST="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          echo "Building image from ${{ matrix.context_dir }}"
+          docker build --platform linux/amd64 \
+            -t "$IMAGE_URI" \
+            -t "$IMAGE_URI_LATEST" \
+            "${{ matrix.context_dir }}"
+
+          echo "Pushing $IMAGE_URI and $IMAGE_URI_LATEST"
+          docker push "$IMAGE_URI"
+          docker push "$IMAGE_URI_LATEST"
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Create Lambda if missing or update if exists
+        env:
+          FUNCTION_NAME: ${{ matrix.lambda_name }}
+          IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
+          ROLE_ARN: ${{ secrets.LAMBDA_EXEC_ROLE_ARN }}
+        run: |
+          set -e
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            echo "Lambda exists. Updating image..."
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --image-uri "$IMAGE_URI"
+          else
+            echo "Lambda does not exist. Creating..."
+            aws lambda create-function \
+              --function-name "$FUNCTION_NAME" \
+              --package-type Image \
+              --code ImageUri="$IMAGE_URI" \
+              --role "$ROLE_ARN" \
+              --architectures x86_64 \
+              --timeout ${{ matrix.timeout }} \
+              --memory-size ${{ matrix.memory }}
+          fi
+
+      - name: Wait for Lambda update to finish
+        env:
+          FUNCTION_NAME: ${{ matrix.lambda_name }}
+        run: |
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME" || true
+          sleep 10
+
+      - name: Update Lambda configuration (env vars, timeout, memory) with retry
+        env:
+          FUNCTION_NAME: ${{ matrix.lambda_name }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          set -e
+          echo "Updating configuration for $FUNCTION_NAME (retrying if update still in progress)..."
+
+          for i in 1 2 3 4 5 6; do
+            if aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --timeout ${{ matrix.timeout }} \
+              --memory-size ${{ matrix.memory }} \
+              --environment "Variables={S3_BUCKET=$S3_BUCKET,BRONZE_PREFIX=bronze,SILVER_PREFIX=silver,GOLD_PREDICTIONS_PREFIX=gold/predictions,GOLD_METRICS_PREFIX=gold/metrics,GOLD_LATEST_PREFIX=gold/latest}"
+            then
+              echo "Config update succeeded on attempt $i"
+              exit 0
+            else
+              echo "Config update failed on attempt $i. Waiting 10s and retrying..."
+              sleep 10
+            fi
+          done
+
+          echo "Config update failed after retries"
+          exit 1
+
+      - name: Print deployed Lambda summary
+        env:
+          FUNCTION_NAME: ${{ matrix.lambda_name }}
+        run: |
+          aws lambda get-function \
+            --function-name "$FUNCTION_NAME" \
+            --query 'Configuration.[FunctionName,PackageType,State,Timeout,MemorySize]' \
+            --output table
