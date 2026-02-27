@@ -7,3 +7,4 @@ RUN python -m pip install --upgrade pip && \
 COPY app.py ${LAMBDA_TASK_ROOT}/
 
 CMD ["app.lambda_handler"]
+
