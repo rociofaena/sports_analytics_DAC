@@ -1,28 +1,37 @@
-name: Deploy Lambda Containers (Bronze->Silver & Silver->Gold)
+name: Deploy Lambda Containers (Bronze->Silver + Silver->Gold)
 
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - "lambda_functions/**"
+      - ".github/workflows/deploy_lambdas.yml"
+
+env:
+  AWS_REGION: eu-west-3
+  AWS_ACCOUNT_ID: 186237763237
+  ECR_REGISTRY: 186237763237.dkr.ecr.eu-west-3.amazonaws.com
 
 jobs:
   deploy-lambdas:
     runs-on: ubuntu-latest
 
-    env:
-      AWS_REGION: eu-west-3
-      AWS_ACCOUNT_ID: 186237763237
-      ECR_REGISTRY: 186237763237.dkr.ecr.eu-west-3.amazonaws.com
-
-      BRONZE_REPO: sports-demo-dev-lambda-bronze-silver
-      SILVER_REPO: sports-demo-dev-lambda-silver-gold
-
-      BRONZE_LAMBDA: sports-demo-dev-lambda-bronze-silver
-      SILVER_LAMBDA: sports-demo-dev-lambda-silver-gold
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: bronze-to-silver
+            context: lambda_functions/bronze_to_silver
+            repo: bronze-to-silver
+          - name: silver-to-gold
+            context: lambda_functions/silver_to_gold
+            repo: silver-to-gold
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # If you're using AWS keys as secrets:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -31,60 +40,43 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region $AWS_REGION \
-          | docker login --username AWS --password-stdin $ECR_REGISTRY
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure ECR repos exist
+      - name: Ensure ECR repo exists
         run: |
-          aws ecr describe-repositories --repository-names "$BRONZE_REPO" --region $AWS_REGION >/dev/null 2>&1 || \
-            aws ecr create-repository --repository-name "$BRONZE_REPO" --region $AWS_REGION
-          aws ecr describe-repositories --repository-names "$SILVER_REPO" --region $AWS_REGION >/dev/null 2>&1 || \
-            aws ecr create-repository --repository-name "$SILVER_REPO" --region $AWS_REGION
+          set -e
+          aws ecr describe-repositories \
+            --repository-names "${{ matrix.repo }}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1 \
+          || aws ecr create-repository \
+            --repository-name "${{ matrix.repo }}" \
+            --region "${AWS_REGION}" >/dev/null
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ---------- Build + Push Bronze->Silver ----------
-      - name: Build and push Bronze->Silver (arm64)
+      - name: Build and push (single-arch linux/arm64)
         run: |
-          IMAGE_URI="$ECR_REGISTRY/$BRONZE_REPO:${{ github.sha }}"
-          IMAGE_LATEST="$ECR_REGISTRY/$BRONZE_REPO:latest"
+          set -e
+          IMAGE_URI="${ECR_REGISTRY}/${{ matrix.repo }}:${GITHUB_SHA}"
+          IMAGE_URI_LATEST="${ECR_REGISTRY}/${{ matrix.repo }}:latest"
 
+          echo "Building ${IMAGE_URI}"
           docker buildx build \
             --platform linux/arm64 \
-            -t "$IMAGE_URI" \
-            -t "$IMAGE_LATEST" \
+            --provenance=false \
+            --sbom=false \
+            -t "${IMAGE_URI}" \
+            -t "${IMAGE_URI_LATEST}" \
             --push \
-            lambda_functions/bronze_to_silver
+            "${{ matrix.context }}"
 
-          echo "BRONZE_IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
 
-      - name: Update Bronze->Silver Lambda to new image
+      - name: Update Lambda to new image
         run: |
+          set -e
           aws lambda update-function-code \
-            --function-name "$BRONZE_LAMBDA" \
-            --image-uri "$BRONZE_IMAGE_URI" \
-            --region "$AWS_REGION"
-
-      # ---------- Build + Push Silver->Gold ----------
-      - name: Build and push Silver->Gold (arm64)
-        run: |
-          IMAGE_URI="$ECR_REGISTRY/$SILVER_REPO:${{ github.sha }}"
-          IMAGE_LATEST="$ECR_REGISTRY/$SILVER_REPO:latest"
-
-          docker buildx build \
-            --platform linux/arm64 \
-            -t "$IMAGE_URI" \
-            -t "$IMAGE_LATEST" \
-            --push \
-            lambda_functions/silver_to_gold
-
-          echo "SILVER_IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
-
-      - name: Update Silver->Gold Lambda to new image
-        run: |
-          aws lambda update-function-code \
-            --function-name "$SILVER_LAMBDA" \
-            --image-uri "$SILVER_IMAGE_URI" \
-            --region "$AWS_REGION"
+            --function-name "${{ matrix.name }}" \
+            --image-uri "${ECR_REGISTRY}/${{ matrix.repo }}:${GITHUB_SHA}" \
+            --region "${AWS_REGION}"
